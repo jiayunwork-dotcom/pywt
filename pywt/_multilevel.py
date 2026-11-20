@@ -19,7 +19,15 @@ import numpy as np
 from ._dwt import dwt, dwt_coeff_len, idwt
 from ._extensions._dwt import dwt_max_level
 from ._extensions._pywt import Modes, Wavelet
-from ._multidim import _fix_coeffs, dwt2, dwtn, idwt2, idwtn
+from ._masking import check_finite, check_mask
+from ._multidim import (
+    _dwtn_propagate,
+    _fix_coeffs,
+    dwt2,
+    dwtn,
+    idwt2,
+    idwtn,
+)
 from ._utils import AxisError, _as_wavelet, _modes_per_axis, _wavelets_per_axis
 
 __all__ = ['wavedec', 'waverec', 'wavedec2', 'waverec2', 'wavedecn',
@@ -46,7 +54,8 @@ def _check_level(sizes, dec_lens, level):
     return level
 
 
-def wavedec(data, wavelet, mode='symmetric', level=None, axis=-1):
+def wavedec(data, wavelet, mode='symmetric', level=None, axis=-1,
+            mask=None):
     """
     Multilevel 1D Discrete Wavelet Transform of data.
 
@@ -64,6 +73,11 @@ def wavedec(data, wavelet, mode='symmetric', level=None, axis=-1):
     axis: int, optional
         Axis over which to compute the DWT. If not given, the
         last axis is used.
+    mask : array_like of bool, optional
+        Observation mask matching ``data`` (``True`` = real observation).
+        When given, a parallel list of boolean trust masks is returned as a
+        second result. Missing cells are treated as zero numerically,
+        regardless of their placeholder value.
 
     Returns
     -------
@@ -96,6 +110,20 @@ def wavedec(data, wavelet, mode='symmetric', level=None, axis=-1):
         raise AxisError("Axis greater than data dimensions")
     level = _check_level(axes_shape, wavelet.dec_len, level)
 
+    if mask is not None:
+        if not np.issubdtype(data.dtype, np.floating):
+            raise ValueError(
+                "mask propagation is only supported for real floating point "
+                "arrays")
+        mask = check_mask(mask, data.shape)
+        check_finite(data, mask)
+        # the single-axis nD path already implements full mask propagation
+        result, mask_result = wavedecn(
+            data, wavelet, mode, level, axes=(axis,), mask=mask)
+        return ([c if isinstance(c, np.ndarray) else c['d'] for c in result],
+                [m if isinstance(m, np.ndarray) else m['d']
+                 for m in mask_result])
+
     coeffs_list = []
 
     a = data
@@ -109,7 +137,7 @@ def wavedec(data, wavelet, mode='symmetric', level=None, axis=-1):
     return coeffs_list
 
 
-def waverec(coeffs, wavelet, mode='symmetric', axis=-1):
+def waverec(coeffs, wavelet, mode='symmetric', axis=-1, coeff_masks=None):
     """
     Multilevel 1D Inverse Discrete Wavelet Transform.
 
@@ -124,6 +152,10 @@ def waverec(coeffs, wavelet, mode='symmetric', axis=-1):
     axis: int, optional
         Axis over which to compute the inverse DWT. If not given, the
         last axis is used.
+    coeff_masks : list, optional
+        Trust masks matching ``coeffs`` (from :func:`wavedec` with a mask).
+        When given, the reconstruction and a boolean mask of the
+        reconstructed samples are returned as a 2-tuple.
 
     Notes
     -----
@@ -152,7 +184,17 @@ def waverec(coeffs, wavelet, mode='symmetric', axis=-1):
             "Coefficient list too short (minimum 1 arrays required).")
     elif len(coeffs) == 1:
         # level 0 transform (just returns the approximation coefficients)
-        return coeffs[0]
+        if coeff_masks is None:
+            return coeffs[0]
+        return coeffs[0], coeff_masks[0]
+
+    if coeff_masks is not None:
+        # reuse the fully-tested nD single-axis reconstruction path
+        n_coeffs = _coeffs_wavedec_to_wavedecn(copy(coeffs))
+        n_masks = _coeffs_wavedec_to_wavedecn(copy(coeff_masks))
+        rec, rec_mask = waverecn(
+            n_coeffs, wavelet, mode, axes=(axis,), coeff_masks=n_masks)
+        return rec, rec_mask
 
     a, ds = coeffs[0], coeffs[1:]
 
@@ -176,7 +218,8 @@ def waverec(coeffs, wavelet, mode='symmetric', axis=-1):
     return a
 
 
-def wavedec2(data, wavelet, mode='symmetric', level=None, axes=(-2, -1)):
+def wavedec2(data, wavelet, mode='symmetric', level=None, axes=(-2, -1),
+             mask=None):
     """
     Multilevel 2D Discrete Wavelet Transform.
 
@@ -195,6 +238,10 @@ def wavedec2(data, wavelet, mode='symmetric', level=None, axes=(-2, -1)):
         will be calculated using the ``dwt_max_level`` function.
     axes : 2-tuple of ints, optional
         Axes over which to compute the DWT. Repeated elements are not allowed.
+    mask : array_like of bool, optional
+        Observation mask matching ``data``. When given, a nested list of
+        boolean trust masks with the same layout as the coefficients is
+        returned as a second result.
 
     Returns
     -------
@@ -240,6 +287,13 @@ def wavedec2(data, wavelet, mode='symmetric', level=None, axes=(-2, -1)):
 
     level = _check_level(axes_sizes, dec_lengths, level)
 
+    if mask is not None:
+        n_coeffs, n_masks = wavedecn(
+            data, wavelet, mode, level, axes, mask=mask)
+        coeffs2 = _coeffs_wavedecn_to_wavedec2(n_coeffs)
+        masks2 = _coeffs_wavedecn_to_wavedec2(n_masks)
+        return coeffs2, masks2
+
     coeffs_list = []
 
     a = data
@@ -253,7 +307,16 @@ def wavedec2(data, wavelet, mode='symmetric', level=None, axes=(-2, -1)):
     return coeffs_list
 
 
-def waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1)):
+def _coeffs_wavedecn_to_wavedec2(coeffs):
+    """Convert wavedecn-format arrays into the wavedec2 nested-tuple layout."""
+    out = [coeffs[0]]
+    for d in coeffs[1:]:
+        out.append((d['da'], d['ad'], d['dd']))
+    return out
+
+
+def waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1),
+             coeff_masks=None):
     """
     Multilevel 2D Inverse Discrete Wavelet Transform.
 
@@ -267,6 +330,10 @@ def waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1)):
         also be a tuple containing a mode to apply along each axis in ``axes``.
     axes : 2-tuple of ints, optional
         Axes over which to compute the IDWT. Repeated elements are not allowed.
+    coeff_masks : list, optional
+        Trust masks matching the nested ``coeffs`` layout (from
+        :func:`wavedec2` with a mask). When given, the reconstruction and a
+        boolean mask of reconstructed samples are returned as a 2-tuple.
 
     Returns
     -------
@@ -308,7 +375,15 @@ def waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1)):
             "Coefficient list too short (minimum 1 array required).")
     elif len(coeffs) == 1:
         # level 0 transform (just returns the approximation coefficients)
-        return coeffs[0]
+        if coeff_masks is None:
+            return coeffs[0]
+        return coeffs[0], coeff_masks[0]
+
+    if coeff_masks is not None:
+        n_coeffs = _coeffs_wavedec2_to_wavedecn(copy(coeffs))
+        n_masks = _coeffs_wavedec2_to_wavedecn(copy(coeff_masks))
+        return waverecn(n_coeffs, wavelet, mode, axes,
+                        coeff_masks=n_masks)
 
     a, ds = coeffs[0], coeffs[1:]
     a = np.asarray(a)
@@ -357,7 +432,8 @@ def _prep_axes_wavedecn(shape, axes):
     return axes, axes_shapes, ndim_transform
 
 
-def wavedecn(data, wavelet, mode='symmetric', level=None, axes=None):
+def wavedecn(data, wavelet, mode='symmetric', level=None, axes=None,
+             mask=None):
     """
     Multilevel nD Discrete Wavelet Transform.
 
@@ -393,6 +469,11 @@ def wavedecn(data, wavelet, mode='symmetric', level=None, axes=None):
 
         where the order of the characters in each key map to the specified
         ``axes``.
+    mask_coeffs : list, optional
+        Only returned when ``mask`` is given. A list of boolean arrays with
+        the same nested structure and shapes as the coefficients; the
+        approximation mask at index 0 carries the accumulated quality
+        information into each subsequent decomposition level.
 
     Examples
     --------
@@ -428,18 +509,41 @@ def wavedecn(data, wavelet, mode='symmetric', level=None, axes=None):
 
     level = _check_level(axes_shapes, dec_lengths, level)
 
+    if mask is not None:
+        if not np.issubdtype(data.dtype, np.floating):
+            raise ValueError(
+                "mask propagation is only supported for real floating point "
+                "arrays")
+        mask = check_mask(mask, data.shape)
+        check_finite(data, mask)
+        data = np.where(mask, data, 0.0)
+
     coeffs_list = []
+    mask_list = []
 
     a = data
+    a_mask = mask
     for i in range(level):
-        coeffs = dwtn(a, wavelet, mode, axes)
+        if a_mask is None:
+            coeffs = dwtn(a, wavelet, mode, axes)
+        else:
+            coeffs, cmasks = _dwtn_propagate(
+                a, wavelet, mode, axes, a_mask)
+            mask_list.append(
+                {k: v for k, v in cmasks.items()
+                 if k != 'a' * ndim_transform})
+            a_mask = cmasks['a' * ndim_transform]
         a = coeffs.pop('a' * ndim_transform)
         coeffs_list.append(coeffs)
 
     coeffs_list.append(a)
     coeffs_list.reverse()
+    if mask is None:
+        return coeffs_list
 
-    return coeffs_list
+    mask_list.append(a_mask)
+    mask_list.reverse()
+    return coeffs_list, mask_list
 
 
 def _match_coeff_dims(a_coeff, d_coeff_dict):
@@ -458,7 +562,7 @@ def _match_coeff_dims(a_coeff, d_coeff_dict):
     return a_coeff[tuple(slice(s) for s in d_coeff.shape)]
 
 
-def waverecn(coeffs, wavelet, mode='symmetric', axes=None):
+def waverecn(coeffs, wavelet, mode='symmetric', axes=None, coeff_masks=None):
     """
     Multilevel nD Inverse Discrete Wavelet Transform.
 
@@ -472,6 +576,13 @@ def waverecn(coeffs, wavelet, mode='symmetric', axes=None):
         also be a tuple containing a mode to apply along each axis in ``axes``.
     axes : sequence of ints, optional
         Axes over which to compute the IDWT.  Axes may not be repeated.
+    coeff_masks : list, optional
+        Trust masks matching the structure and shapes of ``coeffs`` (as
+        returned by :func:`wavedecn` with ``mask``). Coefficients flagged
+        ``False`` participate in the synthesis as zeros. When given, a
+        boolean mask of the reconstructed samples is returned as a second
+        result; a sample is trustworthy only when every non-zero synthesis
+        tap reaching it originates from a trustworthy coefficient.
 
     Returns
     -------
@@ -521,6 +632,32 @@ def waverecn(coeffs, wavelet, mode='symmetric', axes=None):
 
     a, ds = coeffs[0], coeffs[1:]
 
+    if coeff_masks is not None:
+        if len(coeff_masks) != len(coeffs):
+            raise ValueError(
+                "coeff_masks must have the same list length as coeffs "
+                f"({len(coeff_masks)} vs {len(coeffs)})")
+        am, dms = coeff_masks[0], coeff_masks[1:]
+        am = np.asarray(am)
+        if am.dtype != bool or am.shape != np.asarray(a).shape:
+            raise ValueError(
+                "the approximation mask must be boolean and match the "
+                "approximation coefficient shape")
+        for n, (d, dm) in enumerate(zip(ds, dms), start=1):
+            if set(dm.keys()) != set(d.keys()):
+                raise ValueError(
+                    f"mask keys at level {n} do not match coefficient keys")
+            for k in d:
+                mv = np.asarray(dm[k])
+                if mv.dtype != bool or mv.shape != d[k].shape:
+                    raise ValueError(
+                        f"mask {k!r} at level {n} must be boolean with the "
+                        "same shape as its coefficient")
+        dms = [dict(dm) for dm in dms]
+    else:
+        am = None
+        dms = None
+
     # this dictionary check must be prior to the call to _fix_coeffs
     if len(ds) > 0 and not all(isinstance(d, dict) for d in ds):
         raise ValueError(
@@ -534,7 +671,9 @@ def waverecn(coeffs, wavelet, mode='symmetric', axes=None):
 
     if not ds:
         # level 0 transform (just returns the approximation coefficients)
-        return coeffs[0]
+        if coeff_masks is None:
+            return coeffs[0]
+        return coeffs[0], am
     if a is None and not any(ds):
         raise ValueError(
             "At least one coefficient must contain a valid value.")
@@ -572,10 +711,19 @@ def waverecn(coeffs, wavelet, mode='symmetric', axes=None):
         # stored detail coefficients by 1 on any given axis.
         if idx > 0:
             a = _match_coeff_dims(a, d)
+            if am is not None:
+                am = _match_coeff_dims(am, dms[idx])
         d['a' * ndim_transform] = a
-        a = idwtn(d, wavelet, mode, axes)
+        if am is None:
+            a = idwtn(d, wavelet, mode, axes)
+        else:
+            dm = dms[idx]
+            dm['a' * ndim_transform] = am
+            a, am = idwtn(d, wavelet, mode, axes, coeff_masks=dm)
 
-    return a
+    if coeff_masks is None:
+        return a
+    return a, am
 
 
 def _coeffs_wavedec_to_wavedecn(coeffs):
@@ -1031,7 +1179,7 @@ def dwtn_max_level(shape, wavelet, axes=None):
     return min(max_levels)
 
 
-def ravel_coeffs(coeffs, axes=None):
+def ravel_coeffs(coeffs, axes=None, coeff_masks=None):
     """Ravel a set of multilevel wavelet coefficients into a single 1D array.
 
     Parameters
@@ -1044,6 +1192,11 @@ def ravel_coeffs(coeffs, axes=None):
     axes : sequence of ints, optional
         Axes over which the DWT that created ``coeffs`` was performed. The
         default value of None corresponds to all axes.
+    coeff_masks : list, optional
+        Parallel list of boolean trust masks with the same structure and
+        shapes as ``coeffs`` (as produced by :func:`wavedecn` with a mask).
+        When given, the masks are flattened using exactly the same slices
+        and the resulting boolean array is returned as a fourth result.
 
     Returns
     -------
@@ -1058,6 +1211,8 @@ def ravel_coeffs(coeffs, axes=None):
         List of shapes corresponding to each coefficient. For example, in 2D,
         ``coeff_shapes[1]['dd']`` would contain the original shape of the first
         level detail coefficients array.
+    mask_arr : ndarray of bool, optional
+        Flattened trust masks, returned only when ``coeff_masks`` is given.
 
     See Also
     --------
@@ -1073,20 +1228,45 @@ def ravel_coeffs(coeffs, axes=None):
     """
     coeffs, axes, ndim, ndim_transform = _prepare_coeffs_axes(coeffs, axes)
 
+    if coeff_masks is not None:
+        # apply the same wavedec/wavedec2 -> wavedecn normalization used for
+        # the coefficients so the mask layout matches exactly
+        if len(coeff_masks) > 1 and isinstance(coeff_masks[1], np.ndarray):
+            coeff_masks = _coeffs_wavedec_to_wavedecn(copy(coeff_masks))
+        elif (len(coeff_masks) > 1 and
+                isinstance(coeff_masks[1], (tuple, list))):
+            coeff_masks = _coeffs_wavedec2_to_wavedecn(copy(coeff_masks))
+        if len(coeff_masks) != len(coeffs):
+            raise ValueError(
+                "coeff_masks must be a list matching the length of coeffs")
+        if np.asarray(coeff_masks[0]).shape != coeffs[0].shape:
+            raise ValueError(
+                "the approximation mask shape does not match its coefficient")
+        if np.asarray(coeff_masks[0]).dtype != bool:
+            raise TypeError("all masks must be boolean arrays")
+
     # initialize with the approximation coefficients.
     a_coeffs = coeffs[0]
     a_size = a_coeffs.size
 
     if len(coeffs) == 1:
         # only a single approximation coefficient array was found
-        return a_coeffs.ravel(), [slice(a_size), ], [a_coeffs.shape, ]
+        if coeff_masks is None:
+            return a_coeffs.ravel(), [slice(a_size), ], [a_coeffs.shape, ]
+        return (a_coeffs.ravel(), [slice(a_size)], [a_coeffs.shape],
+                np.asarray(coeff_masks[0], dtype=bool).ravel())
 
     # preallocate output array
     arr_size = wavedecn_size(coeffs)
     coeff_arr = np.empty((arr_size, ), dtype=a_coeffs.dtype)
+    mask_arr = (np.empty((arr_size, ), dtype=bool)
+                if coeff_masks is not None else None)
 
     a_slice = slice(a_size)
     coeff_arr[a_slice] = a_coeffs.ravel()
+    if mask_arr is not None:
+        mask_arr[a_slice] = np.asarray(
+            coeff_masks[0], dtype=bool).ravel()
 
     # initialize list of coefficient slices
     coeff_slices = []
@@ -1097,7 +1277,7 @@ def ravel_coeffs(coeffs, axes=None):
     # loop over the detail coefficients, embedding them in coeff_arr
     ds = coeffs[1:]
     offset = a_size
-    for coeff_dict in ds:
+    for level, coeff_dict in enumerate(ds, start=1):
         # new dictionaries for detail coefficient slices and shapes
         coeff_slices.append({})
         coeff_shapes.append({})
@@ -1106,6 +1286,12 @@ def ravel_coeffs(coeffs, axes=None):
                              "coefficients.")
         # sort to make sure key order is consistent across Python versions
         keys = sorted(coeff_dict.keys())
+        if coeff_masks is not None:
+            mask_dict = coeff_masks[level]
+            if set(mask_dict.keys()) != set(keys):
+                raise ValueError(
+                    f"mask keys at level {level} do not match coefficient "
+                    "keys")
         for key in keys:
             d = coeff_dict[key]
             sl = slice(offset, offset + d.size)
@@ -1113,10 +1299,22 @@ def ravel_coeffs(coeffs, axes=None):
             coeff_arr[sl] = d.ravel()
             coeff_slices[-1][key] = sl
             coeff_shapes[-1][key] = d.shape
-    return coeff_arr, coeff_slices, coeff_shapes
+            if mask_arr is not None:
+                mv = np.asarray(mask_dict[key])
+                if mv.dtype != bool:
+                    raise TypeError("all masks must be boolean arrays")
+                if mv.shape != d.shape:
+                    raise ValueError(
+                        f"mask {key!r} at level {level} has shape {mv.shape} "
+                        f"but the coefficient has shape {d.shape}")
+                mask_arr[sl] = mv.ravel()
+    if mask_arr is None:
+        return coeff_arr, coeff_slices, coeff_shapes
+    return coeff_arr, coeff_slices, coeff_shapes, mask_arr
 
 
-def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn'):
+def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn',
+                   mask_arr=None):
     """Unravel a raveled array of multilevel wavelet coefficients.
 
     Parameters
@@ -1135,12 +1333,20 @@ def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn'):
     output_format : {'wavedec', 'wavedec2', 'wavedecn', 'swt', 'swt2', 'swtn'}, optional
         Make the form of the unraveled coefficients compatible with this type
         of multilevel transform. The default is ``'wavedecn'``.
+    mask_arr : array-like of bool, optional
+        Flattened trust masks produced alongside ``arr`` by
+        :func:`ravel_coeffs`. Its length must equal ``arr.size`` and the
+        slices are reused verbatim, so every mask keeps the position of its
+        coefficient. When given, the unraveled mask list is returned as a
+        second result.
 
     Returns
     -------
     coeffs: list
         List of wavelet transform coefficients. The specific format of the list
         elements is determined by ``output_format``.
+    coeff_masks : list, optional
+        Unraveled boolean masks, returned only when ``mask_arr`` is given.
 
     See Also
     --------
@@ -1160,7 +1366,16 @@ def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn'):
 
     """
     arr = np.asarray(arr)
+    if mask_arr is not None:
+        mask_arr = np.asarray(mask_arr)
+        if mask_arr.dtype != bool:
+            raise TypeError("mask_arr must be a boolean array")
+        if mask_arr.shape != arr.shape:
+            raise ValueError(
+                f"mask_arr shape {mask_arr.shape} does not match the "
+                f"coefficient array shape {arr.shape}")
     coeffs = []
+    masks = [] if mask_arr is not None else None
     if len(coeff_slices) == 0:
         raise ValueError("empty list of coefficient slices")
     elif len(coeff_shapes) == 0:
@@ -1169,6 +1384,9 @@ def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn'):
         raise ValueError("coeff_shapes and coeff_slices have unequal length")
     else:
         coeffs.append(arr[coeff_slices[0]].reshape(coeff_shapes[0]))
+        if masks is not None:
+            masks.append(
+                mask_arr[coeff_slices[0]].reshape(coeff_shapes[0]))
 
     # difference coefficients at each level
     for n in range(1, len(coeff_slices)):
@@ -1176,19 +1394,32 @@ def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn'):
         shape_dict = coeff_shapes[n]
         if output_format in ['wavedec', 'swt']:
             d = arr[slice_dict['d']].reshape(shape_dict['d'])
+            md = (mask_arr[slice_dict['d']].reshape(shape_dict['d'])
+                  if masks is not None else None)
         elif output_format in ['wavedec2', 'swt2']:
             d = (arr[slice_dict['da']].reshape(shape_dict['da']),
                  arr[slice_dict['ad']].reshape(shape_dict['ad']),
                  arr[slice_dict['dd']].reshape(shape_dict['dd']))
+            md = ((mask_arr[slice_dict['da']].reshape(shape_dict['da']),
+                   mask_arr[slice_dict['ad']].reshape(shape_dict['ad']),
+                   mask_arr[slice_dict['dd']].reshape(shape_dict['dd']))
+                  if masks is not None else None)
         elif output_format in ['wavedecn', 'swtn']:
             d = {}
+            md = {} if masks is not None else None
             for k, v in coeff_slices[n].items():
                 d[k] = arr[v].reshape(shape_dict[k])
+                if md is not None:
+                    md[k] = mask_arr[v].reshape(shape_dict[k])
         else:
             raise ValueError(
                 f"Unrecognized output format: {output_format}")
         coeffs.append(d)
-    return coeffs
+        if masks is not None:
+            masks.append(md)
+    if masks is None:
+        return coeffs
+    return coeffs, masks
 
 
 def _check_fswavedecn_axes(data, axes):
