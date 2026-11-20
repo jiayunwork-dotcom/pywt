@@ -1188,7 +1188,10 @@ def ravel_coeffs(coeffs, axes=None, coeff_masks=None):
         A list of multilevel wavelet coefficients as returned by
         ``wavedec``, ``wavedec2`` or ``wavedecn``. This function is also
         compatible with the output of ``swt``, ``swt2`` and ``swtn`` if those
-        functions were called with ``trim_approx=True``.
+        functions were called with ``trim_approx=True``. A
+        :class:`pywt.SparseCoeffArchive` is accepted as well; in that case the
+        sparse representation round-trips through this function (see the
+        ``archive`` return value and the Examples section).
     axes : sequence of ints, optional
         Axes over which the DWT that created ``coeffs`` was performed. The
         default value of None corresponds to all axes.
@@ -1202,7 +1205,8 @@ def ravel_coeffs(coeffs, axes=None, coeff_masks=None):
     -------
     coeff_arr : array-like
         Wavelet transform coefficient array. All coefficients have been
-        concatenated into a single array.
+        concatenated into a single array. For a sparse archive the array has
+        the full decomposition length with exact zeros at deleted positions.
     coeff_slices : list
         List of slices corresponding to each coefficient. As a 2D example,
         ``coeff_arr[coeff_slices[1]['dd']]`` would extract the first level
@@ -1213,6 +1217,12 @@ def ravel_coeffs(coeffs, axes=None, coeff_masks=None):
         level detail coefficients array.
     mask_arr : ndarray of bool, optional
         Flattened trust masks, returned only when ``coeff_masks`` is given.
+    archive : SparseCoeffArchive, optional
+        Returned only when ``coeffs`` is a sparse archive, as the final
+        element of the result tuple (fifth element when ``coeff_masks`` is
+        also given, fourth otherwise). The archive preserves the per-band
+        logical positions, dtype, transform settings, original shape and
+        error basis needed to persist the data across processes.
 
     See Also
     --------
@@ -1226,6 +1236,32 @@ def ravel_coeffs(coeffs, axes=None, coeff_masks=None):
     >>> arr, coeff_slices, coeff_shapes = pywt.ravel_coeffs(coeffs)
 
     """
+    # Late import to avoid an import cycle (_sparse imports from this module).
+    from ._sparse import SparseCoeffArchive
+
+    if isinstance(coeffs, SparseCoeffArchive):
+        archive = coeffs
+        if coeff_masks is not None:
+            raise ValueError(
+                "sparse coefficient archives do not accept quality masks")
+        if axes is not None and tuple(int(a) % len(archive.original_shape)
+                                      for a in axes) != archive.axes:
+            raise ValueError(
+                "the axes argument does not match the archive's transform axes")
+        arr = archive.to_raveled()
+        raw_slices = archive.to_metadata()['coeff_slices']
+        coeff_slices = [slice(raw_slices[0]['start'],
+                              raw_slices[0]['stop'],
+                              raw_slices[0]['step'])]
+        for d in raw_slices[1:]:
+            coeff_slices.append({
+                k: slice(v['start'], v['stop'], v['step'])
+                for k, v in d.items()})
+        coeff_shapes = [tuple(archive._coeff_shapes[0])]
+        for d in archive._coeff_shapes[1:]:
+            coeff_shapes.append({k: tuple(v) for k, v in d.items()})
+        return arr, coeff_slices, coeff_shapes, archive
+
     coeffs, axes, ndim, ndim_transform = _prepare_coeffs_axes(coeffs, axes)
 
     if coeff_masks is not None:
@@ -1314,7 +1350,7 @@ def ravel_coeffs(coeffs, axes=None, coeff_masks=None):
 
 
 def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn',
-                   mask_arr=None):
+                   mask_arr=None, archive=None):
     """Unravel a raveled array of multilevel wavelet coefficients.
 
     Parameters
@@ -1339,6 +1375,14 @@ def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn',
         slices are reused verbatim, so every mask keeps the position of its
         coefficient. When given, the unraveled mask list is returned as a
         second result.
+    archive : SparseCoeffArchive, optional
+        When given, ``arr`` is interpreted as sparse archive data produced by
+        :func:`ravel_coeffs` on a :class:`pywt.SparseCoeffArchive`. The
+        archive's own slices, shapes and transform settings are used for
+        validation, fully deleted subbands are restored as zero arrays with
+        their original logical shape, and the same archive is returned as the
+        final result so a round-trip can persist without any dense copy.
+        Quality masks remain unsupported for archives.
 
     Returns
     -------
@@ -1347,6 +1391,8 @@ def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn',
         elements is determined by ``output_format``.
     coeff_masks : list, optional
         Unraveled boolean masks, returned only when ``mask_arr`` is given.
+    archive : SparseCoeffArchive, optional
+        The same archive, returned only when the ``archive`` argument is given.
 
     See Also
     --------
@@ -1365,6 +1411,29 @@ def unravel_coeffs(arr, coeff_slices, coeff_shapes, output_format='wavedecn',
     >>> assert_array_almost_equal(cam, cam_recon)
 
     """
+    if archive is not None:
+        from ._sparse import SparseCoeffArchive
+        if not isinstance(archive, SparseCoeffArchive):
+            raise TypeError("archive must be a SparseCoeffArchive instance")
+        if mask_arr is not None:
+            raise ValueError(
+                "sparse coefficient archives do not accept quality masks")
+        expected = archive.to_raveled()
+        arr = np.asarray(arr)
+        if arr.shape != expected.shape:
+            raise ValueError(
+                "the raveled array shape does not match the archive layout")
+        if not np.array_equal(np.flatnonzero(arr), archive.indices):
+            raise ValueError(
+                "the raveled sparse positions conflict with the archive "
+                "indices")
+        if output_format not in ('wavedec', 'wavedec2', 'wavedecn'):
+            raise ValueError(
+                "sparse archives only support output formats 'wavedec', "
+                f"'wavedec2' and 'wavedecn'; got {output_format!r}")
+        coeffs = archive.to_coeffs(output_format)
+        return coeffs, archive
+
     arr = np.asarray(arr)
     if mask_arr is not None:
         mask_arr = np.asarray(mask_arr)

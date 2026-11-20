@@ -14,6 +14,7 @@ API Reference
    2d-dwt-and-idwt
    nd-dwt-and-idwt
    dwt-coefficient-handling
+   sparse-coefficient-archives
    swt-stationary-wavelet-transform
    iswt-inverse-stationary-wavelet-transform
    mra

@@ -22,6 +22,7 @@ from ._dwt import *
 from ._swt import *
 from ._cwt import *
 from ._mra import *
+from ._sparse import *
 
 from . import data
 

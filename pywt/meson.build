@@ -13,6 +13,7 @@ py.install_sources(
     '_pytest.py',
     '_pytesttester.py',
     '_swt.py',
+    '_sparse.py',
     '_thresholding.py',
     '_utils.py',
     '_wavelet_packets.py',

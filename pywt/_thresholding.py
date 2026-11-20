@@ -10,6 +10,8 @@ functions.
 
 import numpy as np
 
+from ._sparse import SparseCoeffArchive
+
 __all__ = ['threshold', 'threshold_firm']
 
 
@@ -78,6 +80,44 @@ thresholding_options = {'soft': soft,
                         }
 
 
+def _threshold_archive(archive, value, substitute):
+    """Apply hard thresholding to a sparse coefficient archive.
+
+    Only the ``'hard'`` mode is supported for archives: retained values whose
+    magnitude is strictly below ``value`` join the deleted set (they already
+    participate in reconstruction as zeros).  The additional deletion's
+    contribution is accumulated onto the archive's structural error bound
+    without access to the original signal or to previously deleted values.
+    The input object is never modified.
+    """
+    if substitute != 0:
+        raise ValueError(
+            "thresholding a sparse archive only supports substitute=0; "
+            "deleted positions must reconstruct as zero")
+    value = float(value)
+    if not np.isfinite(value) or value < 0:
+        raise ValueError("threshold value must be a non-negative finite number")
+    # hard() uses strict less-than for deletion; keep identical semantics
+    newly_deleted = np.abs(archive.values) < value
+    new_values = archive.values[~newly_deleted].copy()
+    new_indices = archive.indices[~newly_deleted].copy()
+    added_norm = float(np.linalg.norm(
+        archive.values[newly_deleted])) if newly_deleted.any() else 0.0
+    r_product = archive.operator_norm_product
+    added_bound = r_product * added_norm
+    # The original deletion error e0 (||e0||_2 <= old B) and the new
+    # contribution e1 (||e1||_2 <= added_bound) are both synthesis outputs;
+    # the triangle inequality gives the directly auditable bound below.
+    new_bound = archive.error_bound + added_bound
+    new_meta = archive.to_metadata()
+    new_meta['error_bound'] = new_bound
+    new_meta['budget_met'] = bool(
+        new_bound <= archive.budget + 1e-12)
+    # the original signal is unavailable, so no measured error can be quoted
+    new_meta['measured_error'] = None
+    return SparseCoeffArchive(new_values, new_indices, new_meta)
+
+
 def threshold(data, value, mode='soft', substitute=0):
     """
     Thresholds the input data depending on the mode argument.
@@ -105,6 +145,15 @@ def threshold(data, value, mode='soft', substitute=0):
 
     Both ``hard`` and ``soft`` thresholding also support complex-valued data.
 
+    When ``data`` is a :class:`pywt.SparseCoeffArchive`, only ``mode='hard'``
+    is supported.  Retained coefficients below ``value`` are added to the
+    deleted set, surviving values are untouched, and a new archive is returned
+    without modifying the input.  The added deletion's effect is accumulated
+    onto the archive's error bound relative to the original signal without
+    access to that signal or to previously discarded coefficients.  If the new
+    bound exceeds the construction budget the returned archive reports
+    ``budget_met == False``.
+
     Parameters
     ----------
     data : array_like
@@ -115,12 +164,13 @@ def threshold(data, value, mode='soft', substitute=0):
         Decides the type of thresholding to be applied on input data. Default
         is 'soft'.
     substitute : float, optional
-        Substitute value (default: 0).
+        Substitute value (default: 0). Only ``substitute=0`` is allowed for
+        sparse coefficient archives.
 
     Returns
     -------
-    output : array
-        Thresholded array.
+    output : array or SparseCoeffArchive
+        Thresholded array, or a new sparse archive when the input was one.
 
     See Also
     --------
@@ -159,6 +209,13 @@ def threshold(data, value, mode='soft', substitute=0):
     array([ 1. ,  1.5,  2. ,  0. ,  0. ,  0. ,  0. ])
 
     """
+
+    if isinstance(data, SparseCoeffArchive):
+        if mode != 'hard':
+            raise ValueError(
+                "only hard thresholding is supported for sparse coefficient "
+                f"archives; got mode {mode!r}")
+        return _threshold_archive(data, value, substitute)
 
     try:
         return thresholding_options[mode](data, value, substitute)
